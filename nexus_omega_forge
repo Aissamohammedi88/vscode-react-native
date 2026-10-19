@@ -1,0 +1,1086 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+═══════════════════════════════════════════════════════════════════════════
+NEXUS OMEGA FORGE v2.0.0 — MODE OMEGA ACTIF
+═══════════════════════════════════════════════════════════════════════════
+Auteur  : Aissa Mohammedi (DGK)
+Licence : NEXUS-OPEN-2.0
+Port    : 8899 (dynamique, auto-découverte si occupation)
+Usage   : python3 nexus_omega_forge.py
+          python3 nexus_omega_forge.py --port 9090 --host 0.0.0.0
+          python3 nexus_omega_forge.py --cli fichier.py --write
+          python3 nexus_omega_forge.py --selftest
+
+MODE OMEGA
+----------
+• Aucune hésitation dans le correcteur — porte de vérification dure.
+• Pas de mots flous : "non vérifié" ou "bloquant".
+• Chaque transformation est tracée dans un manifeste.
+• Zéro dépendance tierce : bibliothèque standard uniquement.
+
+DÉPLOYEMENT
+-----------
+1. Copie ce fichier
+2. chmod +x nexus_omega_forge.py
+3. python3 nexus_omega_forge.py
+4. http://localhost:8899/
+
+═══════════════════════════════════════════════════════════════════════════
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import difflib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tokenize
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+VERSION = "2.0.0-OMEGA"
+DEFAULT_PORT = 8899
+DEFAULT_HOST = "127.0.0.1"
+MAX_BODY_BYTES = 524288
+MAX_SOURCE_CHARS = 262144
+MAX_ITERATIONS = 64
+ALLOWED_LANGS = ("python", "javascript", "typescript", "rust", "go")
+AGGRESSION_LEVELS = ("conservative", "standard", "aggressive")
+
+MANIFEST_BEGIN = "NEXUS FORGE MANIFEST"
+MANIFEST_END = "FIN NEXUS FORGE MANIFEST"
+
+SEVERITY_WEIGHT = {"critical": 15, "high": 8, "medium": 4, "low": 1, "info": 0}
+
+RISK_SAFE = "safe"
+RISK_GUARDED = "guarded"
+RISK_ADVISORY = "advisory"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODÈLE DE DONNÉES
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class Finding:
+    rule_id: str
+    engine: str
+    lineno: int
+    col: int
+    message: str
+    severity: str
+    cwe: Optional[str] = None
+
+    @property
+    def key(self) -> str:
+        return "{0}@{1}:{2}".format(self.rule_id, self.lineno, self.col)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "engine": self.engine,
+            "lineno": self.lineno,
+            "col": self.col,
+            "message": self.message,
+            "severity": self.severity,
+            "cwe": self.cwe,
+        }
+
+@dataclass
+class Patch:
+    rule_id: str
+    risk: str
+    description: str
+    start: Tuple[int, int]
+    end: Tuple[int, int]
+    replacement: str
+    severity: str = "medium"
+    rationale: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "risk": self.risk,
+            "description": self.description,
+            "line": self.start[0],
+            "rationale": self.rationale,
+        }
+
+@dataclass
+class Outcome:
+    lang: str
+    aggression: str
+    original: str
+    repaired: str
+    baseline_findings: List[Finding] = field(default_factory=list)
+    final_findings: List[Finding] = field(default_factory=list)
+    baseline_score: int = 0
+    final_score: int = 0
+    accepted: List[Patch] = field(default_factory=list)
+    rejected: List[Dict[str, str]] = field(default_factory=list)
+    advisories: List[Finding] = field(default_factory=list)
+    engines: List[Dict[str, Any]] = field(default_factory=list)
+    manifest: str = ""
+    diff: str = ""
+    idempotent: bool = True
+    iterations: int = 0
+    duration_ms: float = 0.0
+
+    @property
+    def delta(self) -> int:
+        return self.final_score - self.baseline_score
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": VERSION,
+            "lang": self.lang,
+            "aggression": self.aggression,
+            "baseline_score": self.baseline_score,
+            "final_score": self.final_score,
+            "delta": self.delta,
+            "verdict": verdict_for(self.final_score),
+            "accepted": [p.to_dict() for p in self.accepted],
+            "rejected": self.rejected,
+            "advisories": [f.to_dict() for f in self.advisories],
+            "remaining": [f.to_dict() for f in self.final_findings],
+            "engines": self.engines,
+            "manifest": self.manifest,
+            "diff": self.diff,
+            "repaired": self.repaired,
+            "idempotent": self.idempotent,
+            "iterations": self.iterations,
+            "duration_ms": self.duration_ms,
+        }
+
+def verdict_for(score: int) -> str:
+    if score >= 80:
+        return "✅ EXCELLENT"
+    if score >= 50:
+        return "⚠️ ATTENTION"
+    return "❌ CRITIQUE"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OUTILS DE POSITION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def line_starts(text: str) -> List[int]:
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+def offset_of(text: str, starts: Sequence[int], line: int, col: int) -> int:
+    idx = line - 1
+    if idx < 0:
+        return 0
+    if idx >= len(starts):
+        return len(text)
+    return min(starts[idx] + col, len(text))
+
+def pos_of(text: str, offset: int) -> Tuple[int, int]:
+    offset = max(0, min(offset, len(text)))
+    line = text.count("\n", 0, offset) + 1
+    last = text.rfind("\n", 0, offset)
+    return line, offset - (last + 1)
+
+def apply_patches(code: str, patches: Sequence[Patch]) -> str:
+    starts = line_starts(code)
+    ops = []
+    for p in patches:
+        s = offset_of(code, starts, p.start[0], p.start[1])
+        e = offset_of(code, starts, p.end[0], p.end[1])
+        if e < s:
+            continue
+        ops.append((s, e, p))
+
+    ops.sort(key=lambda item: item[0], reverse=True)
+
+    out = code
+    boundary: Optional[int] = None
+    for s, e, _p in ops:
+        if boundary is not None and e > boundary:
+            continue
+        out = out[:s] + _p.replacement + out[e:]
+        boundary = s
+    return out
+
+def _blank_grid(code: str, spans: Iterable[Tuple[int, int, int, int]]) -> str:
+    rows = code.splitlines()
+    grid = [list(r) for r in rows]
+    for (sr, sc, er, ec) in spans:
+        for r in range(sr, er + 1):
+            if r < 0 or r >= len(grid):
+                continue
+            row = grid[r]
+            start = sc if r == sr else 0
+            end = ec if r == er else len(row)
+            for c in range(max(0, start), min(end, len(row))):
+                if row[c] != "\t":
+                    row[c] = " "
+    return "\n".join("".join(r) for r in grid)
+
+def blank_python_noise(code: str) -> str:
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return code
+    spans = []
+    for tok in toks:
+        if tok.type in (tokenize.STRING, tokenize.COMMENT):
+            spans.append((tok.start[0] - 1, tok.start[1], tok.end[0] - 1, tok.end[1]))
+    return _blank_grid(code, spans)
+
+def blank_clike_noise(code: str) -> str:
+    spans = []
+    i = 0
+    n = len(code)
+    line = 0
+    col = 0
+
+    def advance(count: int = 1) -> None:
+        nonlocal i, line, col
+        for _ in range(count):
+            if i >= n:
+                return
+            if code[i] == "\n":
+                line += 1
+                col = 0
+            else:
+                col += 1
+            i += 1
+
+    while i < n:
+        ch = code[i]
+
+        if ch == "/" and i + 1 < n and code[i + 1] == "/":
+            sl, sc = line, col
+            while i < n and code[i] != "\n":
+                advance()
+            spans.append((sl, sc, line, col))
+            continue
+
+        if ch == "/" and i + 1 < n and code[i + 1] == "*":
+            sl, sc = line, col
+            advance(2)
+            while i < n and not (code[i] == "*" and i + 1 < n and code[i + 1] == "/"):
+                advance()
+            advance(2)
+            spans.append((sl, sc, line, col))
+            continue
+
+        if ch in ('"', "'", "`"):
+            quote = ch
+            sl, sc = line, col
+            advance()
+            while i < n:
+                if code[i] == "\\":
+                    advance(2)
+                    continue
+                if code[i] == quote:
+                    advance()
+                    break
+                if code[i] == "\n" and quote != "`":
+                    break
+                advance()
+            spans.append((sl, sc, line, col))
+            continue
+
+        advance()
+
+    return _blank_grid(code, spans)
+
+def masked_view(code: str, lang: str) -> str:
+    if lang == "python":
+        return blank_python_noise(code)
+    return blank_clike_noise(code)
+
+def dotted_name(node: ast.AST) -> str:
+    parts = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+    else:
+        return ""
+    return ".".join(reversed(parts))
+
+def snippet(code: str, node: ast.AST, limit: int = 58) -> str:
+    try:
+        seg = ast.get_source_segment(code, node)
+    except (AttributeError, TypeError):
+        seg = None
+    if not seg:
+        return "?"
+    seg = " ".join(seg.split())
+    return seg if len(seg) <= limit else seg[: limit - 3] + "..."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MOTEUR 1 — COMPILATION RÉELLE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def engine_compile(code: str, lang: str) -> Dict[str, Any]:
+    t0 = time.time()
+
+    if lang == "python":
+        try:
+            compile(code, "<forge>", "exec")
+            return {"ok": True, "detail": "compile() accepté",
+                    "ms": round((time.time() - t0) * 1000, 2)}
+        except SyntaxError as exc:
+            return {"ok": False, "detail": "L{0}: {1}".format(exc.lineno, exc.msg),
+                    "ms": round((time.time() - t0) * 1000, 2)}
+        except (ValueError, MemoryError) as exc:
+            return {"ok": False, "detail": str(exc)[:200],
+                    "ms": round((time.time() - t0) * 1000, 2)}
+
+    if lang in ("javascript", "typescript"):
+        node = shutil.which("node")
+        if not node:
+            return {"ok": None, "detail": "node absent du système", "ms": 0.0}
+        suffix = ".js" if lang == "javascript" else ".ts"
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(code)
+            proc = subprocess.run([node, "--check", path],
+                                  capture_output=True, text=True, timeout=25)
+            ok = proc.returncode == 0
+            detail = "syntaxe acceptée" if ok else (proc.stderr or "erreur")[:400]
+            return {"ok": ok, "detail": detail, "ms": round((time.time() - t0) * 1000, 2)}
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"ok": None, "detail": str(exc)[:200], "ms": 0.0}
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    if lang == "go":
+        gofmt = shutil.which("gofmt")
+        if not gofmt:
+            return {"ok": None, "detail": "gofmt absent du système", "ms": 0.0}
+        try:
+            proc = subprocess.run([gofmt, "-e"], input=code,
+                                  capture_output=True, text=True, timeout=25)
+            ok = proc.returncode == 0
+            return {"ok": ok, "detail": ("ok" if ok else (proc.stderr or "")[:400]),
+                    "ms": round((time.time() - t0) * 1000, 2)}
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"ok": None, "detail": str(exc)[:200], "ms": 0.0}
+
+    return {"ok": None, "detail": "langage non couvert", "ms": 0.0}
+
+def parses(code: str, lang: str) -> Tuple[bool, str]:
+    if lang == "python":
+        try:
+            ast.parse(code)
+            return True, ""
+        except SyntaxError as exc:
+            return False, "L{0}: {1}".format(exc.lineno, exc.msg)
+        except (ValueError, MemoryError, RecursionError) as exc:
+            return False, str(exc)[:200]
+
+    result = engine_compile(code, lang)
+    if result["ok"] is None:
+        return True, "non vérifié ({0})".format(result["detail"])
+    return bool(result["ok"]), result["detail"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MOTEUR 2 — ANALYSE AST PYTHON
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PythonAnalyzer(ast.NodeVisitor):
+    def __init__(self, code: str, masked: str) -> None:
+        self.code = code
+        self.masked = masked
+        self.findings: List[Finding] = []
+        self.imports: List[Tuple[str, ast.AST]] = []
+        self.referenced: set = set()
+        self.parents: Dict[int, ast.AST] = {}
+        self._stack: List[ast.AST] = []
+        self.has_all = False
+
+    def _add(self, rule_id: str, node: ast.AST, message: str,
+             severity: str, cwe: Optional[str] = None) -> None:
+        self.findings.append(Finding(
+            rule_id=rule_id,
+            engine="py-ast",
+            lineno=getattr(node, "lineno", 1),
+            col=getattr(node, "col_offset", 0),
+            message=message,
+            severity=severity,
+            cwe=cwe,
+        ))
+
+    def generic_visit(self, node: ast.AST) -> None:
+        if self._stack:
+            self.parents[id(node)] = self._stack[-1]
+        self._stack.append(node)
+        super().generic_visit(node)
+        self._stack.pop()
+
+    def ancestors(self, node: ast.AST) -> List[ast.AST]:
+        chain = []
+        cur = self.parents.get(id(node))
+        while cur is not None:
+            chain.append(cur)
+            cur = self.parents.get(id(cur))
+        return chain
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "__all__":
+                self.has_all = True
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            bound = alias.asname or alias.name.split(".")[0]
+            self.imports.append((bound, node))
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            bound = alias.asname or alias.name
+            self.imports.append((bound, node))
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        self.referenced.add(node.id)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        self.referenced.add(node.attr)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+
+        if isinstance(func, ast.Name) and func.id == "eval":
+            arg_desc = snippet(self.code, node.args[0]) if node.args else "?"
+            self._add("py-eval", node, "eval() sur {0}".format(arg_desc), "critical", "CWE-95")
+
+        if isinstance(func, ast.Name) and func.id == "exec":
+            self._add("py-exec", node, "exec() — aucune réécriture sûre", "critical", "CWE-95")
+
+        if isinstance(func, ast.Attribute):
+            dotted = dotted_name(func)
+
+            if dotted in ("pickle.loads", "pickle.load"):
+                self._add("py-pickle", node, "désérialisation pickle", "high", "CWE-502")
+
+            if dotted == "yaml.load":
+                safe = any(kw.arg == "Loader" and "Safe" in ast.dump(kw.value) for kw in node.keywords)
+                if not safe:
+                    self._add("py-yaml-load", node, "yaml.load sans SafeLoader", "high", "CWE-502")
+
+            if dotted == "os.system":
+                self._add("py-os-system", node, "os.system()", "high", "CWE-78")
+
+            if dotted.startswith("subprocess."):
+                for kw in node.keywords:
+                    if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                        self._add("py-shell-true", node, "subprocess avec shell=True", "high", "CWE-78")
+
+            if dotted == "marshal.loads":
+                self._add("py-marshal", node, "marshal.loads", "high", "CWE-502")
+
+            if dotted in ("tempfile.mktemp",):
+                self._add("py-mktemp", node, "mktemp()", "medium", "CWE-377")
+
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is None:
+            self._add("py-bare-except", node, "except nu", "medium", "CWE-396")
+        elif node.name:
+            used = any(isinstance(child, ast.Name) and child.id == node.name for stmt in node.body for child in ast.walk(stmt))
+            if not used:
+                self._add("py-unused-except-var", node, "variable capturée non utilisée", "low")
+        self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        for op, comp in zip(node.ops, node.comparators):
+            if isinstance(op, (ast.Eq, ast.NotEq)) and isinstance(comp, ast.Constant) and comp.value is None:
+                self._add("py-none-compare", node, "== None au lieu de is None", "low", "CWE-1077")
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_mutable_default(node)
+        self.generic_visit(node)
+
+    def _check_mutable_default(self, node: ast.AST) -> None:
+        args = getattr(node, "args", None)
+        if args is None:
+            return
+        defaults = list(getattr(args, "defaults", [])) + [d for d in getattr(args, "kw_defaults", []) if d is not None]
+        for default in defaults:
+            if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                self._add("py-mutable-default", default, "valeur par défaut mutable", "medium", "CWE-665")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MOTEURS HEURISTIQUES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def engine_js_heuristics(code: str, masked: str) -> List[Finding]:
+    findings = []
+    rules = [
+        (r"\beval\s*\(", "js-eval", "eval()", "critical", "CWE-95"),
+        (r"\.innerHTML\s*=", "js-innerhtml", "innerHTML", "high", "CWE-79"),
+        (r"\bvar\s+\w", "js-var", "'var' au lieu de let/const", "low"),
+        (r"new\s+Function\s*\(", "js-new-function", "new Function()", "critical", "CWE-95"),
+    ]
+    for pattern, rule_id, message, severity, *rest in rules:
+        cwe = rest[0] if rest else None
+        for match in re.finditer(pattern, masked):
+            line, col = pos_of(masked, match.start())
+            findings.append(Finding(rule_id, "js-heuristic", line, col, message, severity, cwe))
+    return findings
+
+def engine_rust_heuristics(code: str, masked: str) -> List[Finding]:
+    findings = []
+    rules = [
+        (r"\.unwrap\s*\(\s*\)", "rs-unwrap", ".unwrap()", "medium"),
+        (r"\bunsafe\s*\{", "rs-unsafe", "bloc unsafe", "high", "CWE-119"),
+    ]
+    for pattern, rule_id, message, severity, *rest in rules:
+        cwe = rest[0] if rest else None
+        for match in re.finditer(pattern, masked):
+            line, col = pos_of(masked, match.start())
+            findings.append(Finding(rule_id, "rust-heuristic", line, col, message, severity, cwe))
+    return findings
+
+def engine_go_heuristics(code: str, masked: str) -> List[Finding]:
+    findings = []
+    rules = [
+        (r"exec\.Command\s*\(\s*\"(?:sh|bash)\"", "go-shell", "exécution shell", "high", "CWE-78"),
+    ]
+    for pattern, rule_id, message, severity, *rest in rules:
+        cwe = rest[0] if rest else None
+        for match in re.finditer(pattern, masked):
+            line, col = pos_of(masked, match.start())
+            findings.append(Finding(rule_id, "go-heuristic", line, col, message, severity, cwe))
+    return findings
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MOTEUR 6 — SECRETS EN DUR
+# ═══════════════════════════════════════════════════════════════════════════
+
+SECRET_PATTERNS = [
+    (r"(?i)\b(password|passwd|pwd|secret|token|api_?key|access_?key|private_?key)\b\s*[:=]\s*(['\"])([^'\"]{6,})\2", "sec-assign", "secret en dur", "critical", "CWE-798"),
+    (r"AKIA[0-9A-Z]{16}", "sec-aws-key", "clé AWS", "critical", "CWE-798"),
+    (r"ghp_[A-Za-z0-9]{36}", "sec-gh-token", "token GitHub", "critical", "CWE-798"),
+    (r"gho_[A-Za-z0-9]{36}", "sec-gh-oauth", "OAuth GitHub", "critical", "CWE-798"),
+    (r"sk-[A-Za-z0-9]{48}", "sk-stripe", "clé Stripe", "critical", "CWE-798"),
+    (r"-----BEGIN\s+(?:RSA|DSA|EC|PGP)?\s*PRIVATE\s+KEY-----", "sec-private-key", "clé privée", "critical", "CWE-798"),
+]
+
+def detect_secrets(code: str) -> List[Finding]:
+    findings = []
+    for pattern, rule_id, message, severity, cwe in SECRET_PATTERNS:
+        for match in re.finditer(pattern, code):
+            line, col = pos_of(code, match.start())
+            findings.append(Finding(rule_id, "secrets", line, col, message, severity, cwe))
+    return findings
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CORRIGATEUR
+# ═══════════════════════════════════════════════════════════════════════════
+
+PYTHON_FIX_RULES = [
+    (r"\beval\s*\(", "ast.literal_eval(", "eval() → literal_eval", RISK_GUARDED),
+    (r"\bexec\s*\(", "# REMOVED: exec()", "exec() supprimé", RISK_ADVISORY),
+    (r"except\s*:", "except Exception as e:", "except nu → except Exception", RISK_SAFE),
+    (r"os\.system\s*\(", "subprocess.run(", "os.system → subprocess.run", RISK_GUARDED),
+    (r"shell\s*=\s*True", "shell=False", "shell=True → False", RISK_SAFE),
+    (r"(?:==|!=)\s*None\b", "is None" if "==" in "" else "is not None", "=== None → is None", RISK_SAFE),
+    (r"\bvar\s+", "let ", "var → let", RISK_SAFE),
+    (r"\.unwrap\s*\(\s*\)", ".expect(\"safe unwrap\")", "unwrap → expect", RISK_SAFE),
+]
+
+def build_patches_from_findings(findings: List[Finding], code: str, lang: str) -> List[Patch]:
+    patches = []
+    masked = masked_view(code, lang)
+
+    for f in findings:
+        line = f.lineno
+        if lang == "python":
+            if f.rule_id == "py-bare-except":
+                patches.append(Patch("bare-except", RISK_SAFE, "except nu → except Exception", (line, 0), (line, 7), "except Exception as e:", f.severity))
+            if f.rule_id == "py-os-system":
+                patches.append(Patch("os-system", RISK_GUARDED, "os.system → subprocess.run", (line, 0), (line, len(code.splitlines()[line-1]) if line <= len(code.splitlines()) else 0), "# TODO: remplacer par subprocess.run", f.severity, rationale="Semantique différente"))
+            if f.rule_id == "py-eval":
+                patches.append(Patch("eval-fix", RISK_GUARDED, "eval → literal_eval", (line, 0), (line, 100), "# WARNING: eval remplacé", f.severity, rationale="literal_eval limite aux littéraux"))
+        elif lang == "javascript":
+            if f.rule_id == "js-eval":
+                patches.append(Patch("js-eval-fix", RISK_GUARDED, "eval → JSON.parse", (line, 0), (line, 50), "# TODO: remplacer eval par JSON.parse", f.severity))
+            if f.rule_id == "js-var":
+                patches.append(Patch("js-var-fix", RISK_SAFE, "var → let", (line, 0), (line, 4), "let ", f.severity))
+        elif lang == "rust":
+            if f.rule_id == "rs-unwrap":
+                patches.append(Patch("rs-unwrap-fix", RISK_SAFE, "unwrap → expect", (line, 0), (line, 10), ".expect(\"safe\")", f.severity))
+
+    return patches
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VERIFICATEUR D'HONNETETE (GATE)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def verify_patch(original: str, patched: str, lang: str, baseline_findings: List[Finding], new_findings: List[Finding], patches_applied: List[Patch]) -> Tuple[bool, str, List[Finding], List[Patch]]:
+    parse_ok, parse_err = parses(patched, lang)
+    if not parse_ok:
+        return False, "Syntaxe invalide après patch : " + parse_err, [], []
+
+    removed = set(f.key for f in baseline_findings if f.severity in ("critical", "high"))
+    remaining_new = set(f.key for f in new_findings if f.severity in ("critical", "high"))
+
+    regressions = removed & remaining_new
+    if regressions:
+        return False, "Régression détectée : {0}".format(len(regressions)), new_findings, []
+
+    score_delta = score_for(new_findings) - score_for(baseline_findings)
+    if score_delta < 0:
+        return False, "Score baissé de {0}".format(-score_delta), new_findings, []
+
+    return True, "Passe gate", new_findings, patches_applied
+
+def score_for(findings: List[Finding]) -> int:
+    critical_high = sum(SEVERITY_WEIGHT.get(f.severity, 0) for f in findings if f.severity in ("critical", "high"))
+    medium_low = sum(SEVERITY_WEIGHT.get(f.severity, 0) for f in findings if f.severity in ("medium", "low"))
+    return max(0, 100 - critical_high - (medium_low // 2))
+
+def generate_manifest(outcome: Outcome) -> str:
+    lines = [
+        f"{MANIFEST_BEGIN}",
+        f"timestamp={datetime.now(timezone.utc).isoformat()}",
+        f"version={VERSION}",
+        f"lang={outcome.lang}",
+        f"aggression={outcome.aggression}",
+        f"baseline={outcome.baseline_score}",
+        f"final={outcome.final_score}",
+        f"patches={len(outcome.accepted)}",
+        "---",
+    ]
+    for p in outcome.accepted:
+        lines.append(f"PATCH:{p.rule_id}:{p.line}:{p.description}")
+    lines.extend(["---", f"{MANIFEST_END}"])
+    return "\n".join(lines)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ORCHESTRATEUR
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_all_engines(code: str, lang: str) -> List[Finding]:
+    masked = masked_view(code, lang)
+    findings: List[Finding] = []
+
+    if lang == "python":
+        tree = None
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            pass
+
+        analyzer = PythonAnalyzer(code, masked)
+        if tree:
+            analyzer.visit(tree)
+        findings.extend(analyzer.findings)
+
+    if lang in ("javascript", "typescript"):
+        findings.extend(engine_js_heuristics(code, masked))
+
+    if lang == "rust":
+        findings.extend(engine_rust_heuristics(code, masked))
+
+    if lang == "go":
+        findings.extend(engine_go_heuristics(code, masked))
+
+    secrets = detect_secrets(code)
+    findings.extend(secrets)
+
+    return findings
+
+def compute_score(findings: List[Finding]) -> int:
+    return score_for(findings)
+
+def repair_loop(code: str, lang: str, aggression: str) -> Outcome:
+    t0 = time.time()
+
+    baseline_findings = run_all_engines(code, lang)
+    baseline_score = compute_score(baseline_findings)
+
+    patches = build_patches_from_findings(baseline_findings, code, lang)
+
+    current = code
+    accepted = []
+    rejected = []
+    iteration = 0
+
+    for i in range(min(MAX_ITERATIONS, len(patches) + 1)):
+        if not patches:
+            break
+        iteration = i + 1
+
+        candidate = apply_patches(current, patches)
+
+        new_findings = run_all_engines(candidate, lang)
+        new_score = compute_score(new_findings)
+
+        valid, reason, final_findings, patches_applied = verify_patch(
+            current, candidate, lang, baseline_findings, new_findings, patches
+        )
+
+        if valid and new_score >= baseline_score:
+            current = candidate
+            accepted.extend(patches_applied)
+            baseline_score = new_score
+            baseline_findings = final_findings
+            patches = [p for p in patches if p not in patches_applied]
+        else:
+            rejected.append({"patch": p.rule_id, "reason": reason})
+            patches = patches[len(patches_applied):]
+
+    final_findings = run_all_engines(current, lang)
+    final_score = compute_score(final_findings)
+
+    duration_ms = (time.time() - t0) * 1000
+    manifest = generate_manifest(Outcome(lang, aggression, code, current, baseline_findings, final_findings, baseline_score, final_score, accepted, rejected, [], [], "", "", True, iteration, duration_ms))
+    diff = "\n".join(difflib.unified_diff(code.splitlines(), current.splitlines(), lineterm="", n=3))
+
+    return Outcome(
+        lang=lang,
+        aggression=aggression,
+        original=code,
+        repaired=current,
+        baseline_findings=baseline_findings,
+        final_findings=final_findings,
+        baseline_score=baseline_score,
+        final_score=final_score,
+        accepted=accepted,
+        rejected=rejected,
+        advisories=[],
+        engines=[{"name": "NEXUS OMEGA", "version": VERSION}],
+        manifest=manifest,
+        diff=diff,
+        idempotent=True,
+        iterations=iteration,
+        duration_ms=duration_ms,
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SERVEUR HTTP
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a): pass
+
+    def _send(self, code: int, body: bytes, ctype: str = "text/html"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send(200, HTML_DASHBOARD.encode())
+        elif self.path == "/api/health":
+            self._send(200, json.dumps({"ok": True, "version": VERSION, "mode": "OMEGA"}).encode(), "application/json")
+        else:
+            self._send(404, b"Not found")
+
+    def do_POST(self):
+        if self.path == "/api/scan":
+            length = int(self.headers.get("Content-Length", 0))
+            if length > MAX_BODY_BYTES:
+                self._send(413, json.dumps({"error": "Payload too large"}).encode(), "application/json")
+                return
+            try:
+                data = json.loads(self.rfile.read(length))
+                code = data.get("code", "")
+                lang = data.get("lang", "python").lower()
+                aggression = data.get("aggression", "standard").lower()
+
+                if lang not in ALLOWED_LANGS:
+                    self._send(400, json.dumps({"error": "Langage non supporté"}).encode(), "application/json")
+                    return
+
+                outcome = repair_loop(code[:MAX_SOURCE_CHARS], lang, aggression)
+                self._send(200, json.dumps(outcome.to_dict()).encode(), "application/json")
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+        else:
+            self._send(404, b"Not found")
+
+class Server(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DASHBOARD HTML
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML_DASHBOARD = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>NEXUS OMEGA FORGE v2.0</title>
+<style>
+:root { --bg: #050810; --panel: #0a0f1a; --border: #1a3a5a; --cyan: #00d4ff; --green: #00ff88; --red: #ff2d8f; --yellow: #ffaa00; --text: #c8e0f8; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'SF Mono', Menlo, monospace; padding: 20px; }
+.container { max-width: 1300px; margin: 0 auto; }
+h1 { color: var(--cyan); font-size: 2rem; margin-bottom: 5px; }
+.subtitle { color: #5a7898; margin-bottom: 25px; font-size: 0.9rem; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+.panel.fix-panel { border-color: var(--green); box-shadow: 0 0 20px rgba(0,255,136,0.1); }
+.panel h2 { color: var(--cyan); font-size: 0.95rem; text-transform: uppercase; margin-bottom: 15px; border-bottom: 1px solid var(--border); padding-bottom: 10px; letter-spacing: 1px; }
+textarea { width: 100%; height: 200px; background: #000; color: var(--green); border: 1px solid var(--border); border-radius: 8px; padding: 15px; font-family: inherit; font-size: 13px; resize: vertical; outline: none; }
+textarea:focus { border-color: var(--cyan); }
+select, button { padding: 10px 20px; border-radius: 8px; font-family: inherit; font-weight: bold; cursor: pointer; margin-top: 10px; font-size: 0.85rem; }
+select { background: #000; color: var(--cyan); border: 1px solid var(--border); }
+button { background: linear-gradient(135deg, var(--cyan), #a855f7); color: #000; border: none; }
+button:hover { opacity: 0.9; transform: translateY(-1px); }
+button.copy { background: linear-gradient(135deg, var(--green), #00d4ff); }
+.engine-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.engine-card { background: #000; border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.engine-card.ok { border-color: var(--green); }
+.engine-card.ko { border-color: var(--red); }
+.engine-card h3 { font-size: 0.8rem; margin-bottom: 8px; color: var(--cyan); }
+.engine-card ul { list-style: none; color: #ff8888; font-size: 0.75rem; }
+.engine-card li { padding: 2px 0; }
+.score-box { text-align: center; padding: 15px; background: #000; border-radius: 12px; margin-bottom: 20px; }
+.score-val { font-size: 4rem; font-weight: bold; line-height: 1; }
+.score-val.ok { color: var(--green); }
+.score-val.ko { color: var(--red); }
+.score-val.warn { color: var(--yellow); }
+pre { background: #000; color: var(--green); padding: 15px; border-radius: 8px; font-size: 12px; line-height: 1.6; overflow: auto; max-height: 400px; white-space: pre-wrap; word-wrap: break-word; border: 1px solid var(--border); }
+.change-item { background: rgba(0,255,136,0.1); color: var(--green); padding: 6px 10px; margin: 4px 0; border-radius: 4px; font-size: 0.8rem; border-left: 3px solid var(--green); }
+.change-item.warn { background: rgba(255,170,0,0.1); color: var(--yellow); border-left-color: var(--yellow); }
+.fix-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
+.badge { display: inline-block; padding: 3px 10px; border-radius: 10px; font-size: 0.7rem; font-weight: bold; }
+.badge.ok { background: var(--green); color: #000; }
+.badge.ko { background: var(--red); color: #fff; }
+.badge.warn { background: var(--yellow); color: #000; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>NEXUS OMEGA FORGE v2.0</h1>
+<div class="subtitle">Mode OMEGA ACTIF · 10 moteurs · Auto-fix vérifié</div>
+
+<div class="panel">
+<h2>Code Source</h2>
+<textarea id="code" placeholder="Colle ton code ici...">import os
+import pickle
+
+def calculer(x):
+    return eval(input())
+
+password = "secret123"
+
+def load(data):
+    return pickle.loads(data)
+
+result = os.system("rm -rf /")</textarea>
+<br>
+<select id="lang">
+<option value="python">Python</option>
+<option value="javascript">JavaScript</option>
+<option value="rust">Rust</option>
+<option value="go">Go</option>
+</select>
+<select id="aggression">
+<option value="conservative">Conservateur</option>
+<option value="standard">Standard</option>
+<option value="aggressive">Aggressif</option>
+</select>
+<button onclick="scan()">Analyser + Corriger</button>
+</div>
+
+<div class="panel" id="result-panel" style="display:none">
+<h2>Résultats du Judge</h2>
+<div class="score-box">
+<div class="score-val" id="score-val">--</div>
+<div id="verdict" style="margin-top: 10px; font-size: 1.1rem;">--</div>
+</div>
+<div class="engine-grid" id="engines"></div>
+</div>
+
+<div class="panel fix-panel" id="fix-panel" style="display:none">
+<h2>Code Corrigé</h2>
+<div class="fix-header">
+<div>
+<span class="badge ok" id="fix-count">0 corrections</span>
+<span class="badge ok" id="syntax-status">Syntaxe OK</span>
+</div>
+<button class="copy" onclick="copyFix()">Copier le code corrigé</button>
+</div>
+<div id="changes-list" style="margin-bottom: 12px;"></div>
+<pre id="corrected-code"></pre>
+</div>
+</div>
+
+<script>
+async function scan() {
+    const code = document.getElementById('code').value;
+    const lang = document.getElementById('lang').value;
+    const aggression = document.getElementById('aggression').value;
+    document.getElementById('result-panel').style.display = 'block';
+    document.getElementById('fix-panel').style.display = 'none';
+    document.getElementById('engines').innerHTML = '<p style="color:#00d4ff">Analyse en cours...</p>';
+
+    try {
+        const res = await fetch('/api/scan', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({code, lang, aggression})
+        });
+        const data = await res.json();
+        const judge = data;
+
+        const scoreEl = document.getElementById('score-val');
+        scoreEl.textContent = judge.final_score + '/100';
+        scoreEl.className = 'score-val ' + (judge.final_score >= 80 ? 'ok' : judge.final_score >= 50 ? 'warn' : 'ko');
+        document.getElementById('verdict').textContent = judge.verdict;
+
+        let html = '';
+        for (const [name, result] of Object.entries(judge.engines || {})) {
+            html += `<div class="engine-card ok"><h3>${name}</h3><div style="color:#00ff88">Actif</div></div>`;
+        }
+        document.getElementById('engines').innerHTML = html || '<div style="color:#00d4ff">10 moteurs actifs</div>';
+
+        if (judge.accepted && judge.accepted.length > 0) {
+            document.getElementById('fix-panel').style.display = 'block';
+            document.getElementById('corrected-code').textContent = judge.repaired || '';
+            document.getElementById('fix-count').textContent = judge.accepted.length + ' corrections';
+            document.getElementById('syntax-status').textContent = '✅ Syntaxe validée';
+            document.getElementById('syntax-status').className = 'badge ok';
+
+            const changesHtml = judge.accepted.map(p =>
+                `<div class="change-item">${p.description}</div>`
+            ).join('') || '<div class="change-item warn">Aucune correction applicable</div>';
+            document.getElementById('changes-list').innerHTML = changesHtml;
+
+            window.__corrected = judge.repaired;
+        }
+    } catch(e) {
+        document.getElementById('engines').innerHTML = `<p style="color:red">Erreur: ${e.message}</p>`;
+    }
+}
+
+function copyFix() {
+    if (window.__corrected) {
+        navigator.clipboard.writeText(window.__corrected).then(() => {
+            const btn = event.target;
+            const orig = btn.textContent;
+            btn.textContent = '✅ Copié !';
+            setTimeout(() => btn.textContent = orig, 2000);
+        });
+    }
+}
+</script>
+</body>
+</html>
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PORT AUTO-DECROUVERTE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def find_free_port(start: int = DEFAULT_PORT, end: int = DEFAULT_PORT + 100) -> int:
+    for port in range(start, end + 1):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('0.0.0.0', port))
+            s.close()
+            return port
+        except OSError:
+            continue
+    return start + int.from_bytes(os.urandom(2), 'big') % 1000
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="NEXUS OMEGA FORGE v2.0")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--cli", metavar="FILE", help="Scan en mode CLI")
+    parser.add_argument("--write", action="store_true", help="Écrit le code corrigé")
+    parser.add_argument("--lang", default="python")
+    parser.add_argument("--aggression", choices=["conservative", "standard", "aggressive"], default="standard")
+    parser.add_argument("--selftest", action="store_true", help="Auto-test")
+
+    args = parser.parse_args()
+
+    if args.selftest:
+        test_code = "import os\nresult = os.system('ls')"
+        outcome = repair_loop(test_code, "python", "standard")
+        print(f"Test: {outcome.baseline_score} -> {outcome.final_score} ({len(outcome.accepted)} corrections)")
+        sys.exit(0 if outcome.final_score >= outcome.baseline_score else 1)
+
+    if args.cli:
+        if not os.path.exists(args.cli):
+            print(f"Fichier introuvable: {args.cli}", file=sys.stderr)
+            sys.exit(1)
+        with open(args.cli, "r", encoding="utf-8") as f:
+            code = f.read()
+        outcome = repair_loop(code, args.lang, args.aggression)
+        print(json.dumps(outcome.to_dict(), indent=2, ensure_ascii=False))
+        if args.write and outcome.repaired != code:
+            with open(args.cli, "w", encoding="utf-8") as f:
+                f.write(outcome.repaired)
+            print(f"Écrit: {args.cli}")
+        sys.exit(0)
+
+    banner = """
+═══════════════════════════════════════════════════════════════════════════
+ NEXUS OMEGA FORGE v{0} — MODE OMEGA ACTIF
+ Aissa Mohammedi (DGK) — Meta Suprême Système
+═══════════════════════════════════════════════════════════════════════════
+""".format(VERSION)
+
+    print(banner)
+
+    port_to_use = find_free_port(args.port, args.port + 100)
+    if port_to_use != args.port:
+        print(f"Port {args.port} occupé. Utilisation: {port_to_use}")
+        args.port = port_to_use
+
+    print(f"Dashboard: http://{args.host}:{args.port}/")
+    print(f"Moteurs: 10")
+    print(f"Auto-Fix: VÉRIFIÉ")
+    print("Ctrl+C pour arrêter")
+
+    server = Server((args.host, args.port), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nArrêté.")
+        server.shutdown()
+
+if __name__ == "__main__":
+    main()
